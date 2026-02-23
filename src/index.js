@@ -5,6 +5,8 @@ const PROVIDERS = {
   anthropic: { upstream: 'https://api.anthropic.com', keyHeader: 'x-api-key', keyEnv: 'ANTHROPIC_API_KEY' },
   openrouter: { upstream: 'https://openrouter.ai/api', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'OPENROUTER_API_KEY' },
   openai: { upstream: 'https://api.openai.com', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'OPENAI_API_KEY' },
+  deepseek: { upstream: 'https://api.deepseek.com', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'DEEPSEEK_API_KEY' },
+  kimi: { upstream: 'https://api.moonshot.ai', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'KIMI_API_KEY' },
 };
 
 const json = (data, status = 200) => new Response(JSON.stringify(data), {
@@ -28,7 +30,7 @@ export default {
     const providerName = segments[0];
     const provider = PROVIDERS[providerName];
     if (!provider) {
-      return json({ error: 'Unknown route. Use /anthropic/*, /openrouter/*, or /openai/*' }, 404);
+      return json({ error: 'Unknown route. Use /anthropic/*, /openai/*, /openrouter/*, /deepseek/*, or /kimi/*' }, 404);
     }
 
     const agentId = request.headers.get('x-agent-id') || 'default';

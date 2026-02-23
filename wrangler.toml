@@ -1,16 +1,17 @@
 name = "ufw"
 main = "src/index.js"
 compatibility_date = "2024-12-01"
+workers_dev = true
+
+# Custom domain route
+routes = [
+  { pattern = "force.cerul.org/*", zone_name = "cerul.org" }
+]
 
 # KV namespace for logs, stats, and kill switch
 [[kv_namespaces]]
 binding = "UFW_LOGS"
 id = "258173fc854243d696eb639c565a0db1"
-
-# Custom domain route (uncomment after first deploy)
-# routes = [
-#   { pattern = "force.cerul.org/*", zone_name = "cerul.org" }
-# ]
 
 # Required secrets (set via `wrangler secret put <NAME>`):
 # ADMIN_KEY          — admin endpoint authentication
@@ -18,6 +19,8 @@ id = "258173fc854243d696eb639c565a0db1"
 # ANTHROPIC_API_KEY  — real Anthropic API key
 # OPENROUTER_API_KEY — real OpenRouter API key
 # OPENAI_API_KEY     — real OpenAI API key
+# DEEPSEEK_API_KEY   — real DeepSeek API key
+# KIMI_API_KEY       — real Moonshot/Kimi API key
 # SCAN_PATTERNS      — JSON array of regex strings for secret scanning
 # DISCORD_WEBHOOK_URL— Discord webhook for block alerts
 # RATE_LIMIT_PER_MIN — max requests per agent per minute (default: 30)
