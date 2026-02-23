@@ -165,6 +165,16 @@ curl https://your-worker.workers.dev/admin/blocks \
 - **Rate limiting is real budget protection.** Your agent goes into a loop at 3am? UFW cuts it off at 30 requests per minute. That's the difference between waking up to a $0.47 balance and waking up to a normal day. Not exact to the millisecond — close enough to save your money.
 - **The proxy token is a shared secret.** One token for all your agents. Simple. If you need per-agent auth later, it's easy to add.
 
+## Testing the Scanner (and the Gotcha)
+
+Want to see it work? Send a message containing a fake key that matches a pattern — something like `sk-ant-api03-FAKE1234567890abcdefghijklmnop`. UFW will block it and log it. Satisfying.
+
+**The gotcha with AI agents:** once a blocked message is in the conversation history, every follow-up request will also get blocked — because the agent sends the full chat history with every API call, and that fake key is still sitting in there. UFW scans the entire request body, not just the latest message.
+
+**The fix:** start a new session. The old conversation carries the poison; a new one starts clean. UFW has no memory of past blocks — it doesn't ban you or hold a grudge. Each request is scanned fresh. If the request body is clean, it passes.
+
+This is actually a feature, not a bug. If a real secret ends up anywhere in a conversation — even buried 50 messages deep — UFW catches it every single time until that conversation is gone.
+
 ## Need Help?
 
 Paste this entire README into Claude, ChatGPT, or whatever AI you've got and tell it to set this up for you. It'll walk you through every step — that's literally what it's for.
