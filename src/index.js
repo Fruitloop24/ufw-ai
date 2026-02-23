@@ -115,6 +115,7 @@ export default {
     // --- Outbound response scanning (chat completions only) ---
     if (isChatCompletions && upstreamResponse.status === 200) {
       const responseBody = await upstreamResponse.text();
+      console.log(`[UFW] Scanning response: ${responseBody.length} bytes, content-type: ${upstreamResponse.headers.get('content-type')}`);
       const { redacted, matched } = scanResponseContent(env, responseBody);
 
       if (matched.length > 0) {
@@ -281,15 +282,15 @@ function scanSecrets(env, body) {
 // ==================== Outbound Response Scanning ====================
 
 const RESPONSE_PATTERNS = [
-  /sk-[a-zA-Z0-9]{20,}/g,
-  /ghp_[a-zA-Z0-9]{36}/g,
-  /eyJ[a-zA-Z0-9_-]{20,}/g,
-  /AKIA[A-Z0-9]{16}/g,
-  /rpa_[a-zA-Z0-9]{40,}/g,
-  /xox[bpras]-[a-zA-Z0-9-]{10,}/g,
-  /[0-9]+:AA[a-zA-Z0-9_-]{30,}/g,
-  /[a-f0-9]{64}/g,
-  /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}:[a-f0-9]{32}/g,
+  /sk-[a-zA-Z0-9_-]{20,}/g,          // OpenAI, DeepSeek, generic (sk-proj-*, sk-ant-api03-*, etc.)
+  /ghp_[a-zA-Z0-9]{36}/g,            // GitHub personal access tokens
+  /eyJ[a-zA-Z0-9_-]{20,}/g,          // JWT tokens
+  /AKIA[A-Z0-9]{16}/g,               // AWS access key IDs
+  /rpa_[a-zA-Z0-9]{40,}/g,           // RunPod API keys
+  /xox[bpras]-[a-zA-Z0-9-]{10,}/g,   // Slack tokens
+  /[0-9]+:AA[a-zA-Z0-9_-]{30,}/g,    // Telegram bot tokens
+  /[a-f0-9]{64}/g,                   // 64-char hex strings (gateway tokens, etc.)
+  /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}:[a-f0-9]{32}/g, // fal.ai UUID:hex
 ];
 
 const KNOWN_SECRET_KEYS = [
