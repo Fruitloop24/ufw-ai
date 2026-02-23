@@ -72,32 +72,13 @@ export default {
       }
     }
 
-    // --- Proxy forward ---
+    // --- Proxy forward (request unchanged — don't touch stream setting) ---
     const restPath = '/' + segments.slice(1).join('/');
     const upstreamUrl = provider.upstream + restPath + url.search;
     const isChatCompletions = restPath.endsWith('/chat/completions');
 
-    // Force non-streaming on chat completions so we can scan the full response
-    let forwardBody = body;
-    let wasStreaming = false;
-    if (isChatCompletions && body && request.method === 'POST') {
-      try {
-        const parsed = JSON.parse(body);
-        if (parsed.stream) {
-          wasStreaming = true;
-          parsed.stream = false;
-          delete parsed.stream_options;
-          forwardBody = JSON.stringify(parsed);
-        }
-      } catch {
-        // Not valid JSON — forward as-is
-      }
-    }
-
     const proxyHeaders = new Headers(request.headers);
-    // Remove the proxy auth header before forwarding
     proxyHeaders.delete('authorization');
-    // Inject the real API key
     const realKey = env[provider.keyEnv];
     if (provider.keyPrefix) {
       proxyHeaders.set(provider.keyHeader, provider.keyPrefix + realKey);
@@ -105,15 +86,11 @@ export default {
       proxyHeaders.set(provider.keyHeader, realKey);
     }
     proxyHeaders.delete('host');
-    // Recalculate content-length when we modified the body
-    if (wasStreaming) {
-      proxyHeaders.delete('content-length');
-    }
 
     const upstreamResponse = await fetch(upstreamUrl, {
       method: request.method,
       headers: proxyHeaders,
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? forwardBody : undefined,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? body : undefined,
     });
 
     // --- Usage logging (non-blocking) ---
@@ -124,28 +101,37 @@ export default {
       const contentType = upstreamResponse.headers.get('content-type') || '';
       const isSSE = contentType.includes('text/event-stream');
 
-      let responseBody;
       if (isSSE) {
-        // Provider ignored stream:false — buffer SSE, extract content, build JSON response
-        responseBody = await assembleSSEResponse(upstreamResponse);
-        console.log(`[UFW] Assembled SSE response: ${responseBody.length} bytes`);
+        // Streaming: buffer all chunks, extract content, scan, replay as SSE
+        const rawSSE = await upstreamResponse.text();
+        const assembled = assembleSSEContent(rawSSE);
+        console.log(`[UFW] Scanning SSE: ${assembled.content.length} chars`);
+        const { scannedContent, matched } = scanText(env, assembled.content);
+
+        if (matched.length > 0) {
+          ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
+          const redactedSSE = buildRedactedSSE(assembled, scannedContent);
+          return new Response(redactedSSE, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' },
+          });
+        }
+
+        // Clean — replay original SSE unchanged
+        return new Response(rawSSE, { status: 200, headers: upstreamResponse.headers });
       } else {
-        responseBody = await upstreamResponse.text();
+        // Non-streaming JSON
+        const responseBody = await upstreamResponse.text();
+        console.log(`[UFW] Scanning JSON: ${responseBody.length} bytes`);
+        const { redacted, matched } = scanResponseContent(env, responseBody);
+
+        if (matched.length > 0) {
+          ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
+          return new Response(redacted, { status: 200, headers: upstreamResponse.headers });
+        }
+
+        return new Response(responseBody, { status: 200, headers: upstreamResponse.headers });
       }
-
-      console.log(`[UFW] Scanning response: ${responseBody.length} bytes, content-type: ${contentType}`);
-      const { redacted, matched } = scanResponseContent(env, responseBody);
-
-      const responseHeaders = new Headers(upstreamResponse.headers);
-      responseHeaders.set('content-type', 'application/json');
-      responseHeaders.delete('content-length');
-
-      if (matched.length > 0) {
-        ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
-        return new Response(redacted, { status: 200, headers: responseHeaders });
-      }
-
-      return new Response(responseBody, { status: 200, headers: responseHeaders });
     }
 
     // Non-chat or non-200 — pass through unchanged
@@ -294,12 +280,10 @@ function scanSecrets(env, body) {
   return null;
 }
 
-// ==================== SSE Response Assembly ====================
+// ==================== SSE Response Handling ====================
 
-async function assembleSSEResponse(response) {
-  const text = await response.text();
-  const lines = text.split('\n');
-
+function assembleSSEContent(rawSSE) {
+  const lines = rawSSE.split('\n');
   let role = 'assistant';
   let content = '';
   let model = 'unknown';
@@ -310,7 +294,6 @@ async function assembleSSEResponse(response) {
     if (!line.startsWith('data: ')) continue;
     const data = line.slice(6).trim();
     if (data === '[DONE]') continue;
-
     try {
       const chunk = JSON.parse(data);
       if (chunk.id) id = chunk.id;
@@ -324,19 +307,53 @@ async function assembleSSEResponse(response) {
     }
   }
 
-  // Rebuild as a standard non-streaming response
-  const assembled = {
-    id: id || 'chatcmpl-assembled',
-    object: 'chat.completion',
-    model,
+  return { id, model, role, content, finishReason };
+}
+
+function scanText(env, text) {
+  let scanned = text;
+  const matched = [];
+  const knownSecrets = getKnownSecrets(env);
+
+  for (const secret of knownSecrets) {
+    if (scanned.includes(secret.value)) {
+      matched.push(`known:${secret.name}`);
+      scanned = scanned.split(secret.value).join('[REDACTED-BY-UFW]');
+    }
+  }
+
+  for (const pattern of RESPONSE_PATTERNS) {
+    pattern.lastIndex = 0;
+    if (pattern.test(scanned)) {
+      matched.push(`pattern:${pattern.source.slice(0, 30)}`);
+      pattern.lastIndex = 0;
+      scanned = scanned.replace(pattern, '[REDACTED-BY-UFW]');
+    }
+  }
+
+  return { scannedContent: scanned, matched };
+}
+
+function buildRedactedSSE(assembled, redactedContent) {
+  // Send the full redacted content as a single SSE chunk, then DONE
+  const chunk = {
+    id: assembled.id || 'chatcmpl-redacted',
+    object: 'chat.completion.chunk',
+    model: assembled.model,
     choices: [{
       index: 0,
-      message: { role, content },
-      finish_reason: finishReason || 'stop',
+      delta: { role: assembled.role, content: redactedContent },
+      finish_reason: null,
     }],
   };
+  const doneChunk = {
+    id: assembled.id || 'chatcmpl-redacted',
+    object: 'chat.completion.chunk',
+    model: assembled.model,
+    choices: [{ index: 0, delta: {}, finish_reason: assembled.finishReason || 'stop' }],
+  };
 
-  return JSON.stringify(assembled);
+  return `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(doneChunk)}\n\ndata: [DONE]\n\n`;
 }
 
 // ==================== Outbound Response Scanning ====================
