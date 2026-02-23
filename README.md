@@ -1,195 +1,155 @@
 # UFW — Universal Firewall for AI Agents
 
-An edge-deployed API proxy that scans AI agent traffic for leaked secrets, injects API keys so agents never hold them, and gives you a kill switch for everything. One Cloudflare Worker. Zero dependencies.
+You want to experiment with the latest AI models. Build cool stuff. Run agents on a Pi, a VPS, wherever. But you've got $20 on your API key and a knot in your stomach.
 
-## The Problem
+**What if your agent leaks your API key?** It's sitting right there in the environment. One weird prompt, one bad tool call, and your key is in someone else's logs. Gone.
 
-AI agents run autonomously. They generate content, make API calls, and process data — often without you watching. If an agent leaks an API key, an env var, or a secret in its request body, that secret hits the provider's servers before you even know it happened.
+**What if your agent goes into a loop?** You wake up, check your dashboard, and your $20 is now $0.47. It burned through your budget while you were sleeping.
 
-You can't solve this with more AI. An LLM reviewing its own output for secrets is slow, expensive, and unreliable. It might miss things. It might hallucinate blocks on clean requests.
+**What if you just need it to stop?** Right now. From your phone. No SSH, no terminal, just *stop*.
 
-## The Solution: Go Old-School
+That's what UFW does.
 
-UFW applies one of the oldest, most battle-tested filtering methods in computing to AI agent traffic: **regex pattern matching**.
+## How It Keeps You Safe
 
-The same principle behind `ipchains`, `iptables`, and every packet filter ever written. You define patterns — API key prefixes like `sk-ant-`, `AKIA`, `sk-`, env var formats like `SECRET=`, `TOKEN=`, even honeypot strings you plant deliberately. Every outbound request body gets scanned at the Cloudflare edge before it reaches any provider.
-
-Match = block + Discord alert + full logging.
-
-No AI in the scanning loop. No inference costs. No hallucinated blocks. Just deterministic boolean matching against known secret formats. It catches what AI can't outsmart because there's nothing to outsmart — it's a pattern match.
-
-**And it runs in ~1ms at the edge.** Your agent doesn't even feel it.
-
-## How It Works
+UFW sits between your agent and the AI providers. Every request passes through it. Your agent never touches a real API key — UFW holds the keys and injects them at the last second, only after the request passes inspection.
 
 ```
-┌──────────────┐         ┌─────────────────────────────┐         ┌──────────────┐
-│              │         │     UFW (Cloudflare Edge)    │         │              │
-│   AI Agent   │────────▶│                              │────────▶│  Provider    │
-│  (Pi, VPS,   │         │  1. Auth check               │         │  (Anthropic, │
-│   laptop)    │◀────────│  2. Kill switch check         │◀────────│   OpenAI,    │
-│              │         │  3. Rate limit check          │         │   OpenRouter)│
-└──────────────┘         │  4. Regex secret scan ◀─ BLOCK│         └──────────────┘
-                         │  5. Inject real API key       │
-                         │  6. Forward + log             │
-                         └─────────────────────────────┘
-                                    ~1ms
+Your Agent  ──▶  UFW (Cloudflare Edge)  ──▶  Anthropic / OpenAI / OpenRouter
+                  ├─ Is this agent authorized?
+                  ├─ Is the kill switch on?
+                  ├─ Has this agent hit its rate limit?
+                  ├─ Are there any secrets in this request? ◀─ BLOCK
+                  ├─ Inject the real API key
+                  └─ Forward and log
 ```
 
-Your agent sends requests to `https://force.cerul.org/anthropic/v1/messages` instead of `https://api.anthropic.com/v1/messages`. UFW handles the rest.
+All of this happens in about 1 millisecond. Your agent doesn't even notice.
 
-## What You Get
+## What It Stops
 
-- **Secret scanning** — regex patterns catch API keys, env vars, and honeypot tokens before they leave your network
-- **API key injection** — agents never hold real provider keys. UFW stores them encrypted in Cloudflare secrets and injects them at the edge
-- **Kill switch** — shut down all agent API access with one curl from your phone
-- **Rate limiting** — per-agent, per-minute and per-hour limits. Configurable via secrets
-- **Discord alerts** — instant notification when a request gets blocked
-- **Multi-provider routing** — Anthropic, OpenAI, and OpenRouter through one endpoint
-- **Usage logging** — every request logged with agent ID, provider, model, timestamp
-- **Block logging** — blocked requests stored with full context for review
-- **Multi-agent support** — `X-Agent-ID` header for per-agent tracking and limits
+**Secrets leaking out.** UFW scans every outgoing request for things that look like API keys, passwords, tokens, and private keys. If it finds one, the request gets blocked before it ever leaves your network. You get an alert. The agent gets an error. Your secret stays secret.
 
-## Setup (5 minutes)
+**Runaway costs.** Set a rate limit — say, 30 requests per minute or 500 per hour. If your agent starts looping or goes off the rails, it hits the wall. Your budget survives.
 
-### 1. Clone and create KV namespace
+**Everything, instantly.** The kill switch shuts down all agent traffic with one command. From your phone, from anywhere. Hit it, figure out what went wrong, then turn it back on when you're ready.
+
+**Agents holding your keys.** Your real API keys live in Cloudflare's encrypted secret store. Your agent only gets a proxy token that means nothing outside of UFW. If that token leaks, you rotate it in 10 seconds. Your actual provider keys never move.
+
+## What You Need
+
+- A free [Cloudflare](https://cloudflare.com) account
+- Your AI provider API keys (Anthropic, OpenAI, OpenRouter — whatever you use)
+- 5 minutes
+
+The free tier covers 100,000 requests per day. For experimenting and small projects, you'll never pay a cent.
+
+## Quick Setup
+
+### 1. Clone and create storage
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/ufw.git
-cd ufw
-wrangler kv namespace create UFW_LOGS
+git clone https://github.com/Fruitloop24/ufw-ai.git
+cd ufw-ai
+npx wrangler kv namespace create UFW_LOGS
 ```
 
-Copy the namespace ID from the output and paste it into `wrangler.toml` replacing `YOUR_KV_NAMESPACE_ID`.
+Paste the namespace ID into `wrangler.toml` where it says `YOUR_KV_NAMESPACE_ID`.
 
-### 2. Set your secrets
+### 2. Add your secrets
 
 ```bash
-# Admin endpoint auth (pick something strong)
-wrangler secret put ADMIN_KEY
-
-# Proxy auth token (your agents will send this)
-wrangler secret put PROXY_KEY
-
-# Provider API keys
-wrangler secret put ANTHROPIC_API_KEY
-wrangler secret put OPENROUTER_API_KEY
-wrangler secret put OPENAI_API_KEY
-
-# Secret scanning patterns (see example below)
-wrangler secret put SCAN_PATTERNS
-
-# Discord webhook for block alerts
-wrangler secret put DISCORD_WEBHOOK_URL
-
-# Rate limits (optional — defaults: 30/min, 500/hour)
-wrangler secret put RATE_LIMIT_PER_MIN
-wrangler secret put RATE_LIMIT_PER_HOUR
+npx wrangler secret put ADMIN_KEY        # your admin password
+npx wrangler secret put PROXY_KEY        # token your agents will use
+npx wrangler secret put ANTHROPIC_API_KEY
+npx wrangler secret put OPENAI_API_KEY
+npx wrangler secret put SCAN_PATTERNS    # see below
 ```
 
 ### 3. Deploy
 
 ```bash
-wrangler deploy
+npx wrangler deploy
 ```
 
-### 4. Custom domain (optional)
+That's it. Your firewall is live.
 
-In the Cloudflare dashboard:
-1. Go to Workers & Pages → your `ufw` worker
-2. Settings → Triggers → Custom Domains
-3. Add `force.cerul.org` (or your domain)
+### 4. Point your agent at UFW
 
-Or uncomment the `routes` section in `wrangler.toml` and redeploy.
-
-## Agent Configuration
-
-Point your agent's provider base URLs at UFW and add the proxy auth header.
+Instead of talking directly to the AI provider, your agent talks to UFW:
 
 ```bash
-# Environment variables for OpenClaw or any agent
-ANTHROPIC_BASE_URL=https://force.cerul.org/anthropic
-OPENAI_BASE_URL=https://force.cerul.org/openai
-OPENROUTER_BASE_URL=https://force.cerul.org/openrouter
+ANTHROPIC_BASE_URL=https://your-worker.your-subdomain.workers.dev/anthropic
+OPENAI_BASE_URL=https://your-worker.your-subdomain.workers.dev/openai
+```
 
-# Auth header (add to all requests)
+Add the proxy token to your agent's requests:
+```
 Authorization: Bearer YOUR_PROXY_KEY
-
-# Optional: identify this agent for per-agent tracking
-X-Agent-ID: openclaw-pi-01
 ```
 
-That's it. Two env vars and a header. Your agent talks to UFW, UFW talks to the providers.
+Your agent doesn't need any real API keys. UFW handles that part.
 
-## Admin Endpoints
+## Kill Switch
 
-All admin endpoints require the `X-Admin-Key` header.
-
-### Health check
+Shut everything down:
 ```bash
-curl -X POST https://force.cerul.org/admin/test \
-  -H "X-Admin-Key: YOUR_ADMIN_KEY"
-```
-
-### Toggle kill switch
-```bash
-# Kill everything
-curl -X POST https://force.cerul.org/admin/kill \
+curl -X POST https://your-worker.workers.dev/admin/kill \
   -H "X-Admin-Key: YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"enabled": false}'
+```
 
-# Resume
-curl -X POST https://force.cerul.org/admin/kill \
+Turn it back on when you're ready:
+```bash
+curl -X POST https://your-worker.workers.dev/admin/kill \
   -H "X-Admin-Key: YOUR_ADMIN_KEY" \
   -H "Content-Type: application/json" \
   -d '{"enabled": true}'
 ```
 
-### View usage stats (last 24h)
-```bash
-curl https://force.cerul.org/admin/stats \
-  -H "X-Admin-Key: YOUR_ADMIN_KEY"
-```
+## Secret Scanning Patterns
 
-### View blocked requests
-```bash
-curl https://force.cerul.org/admin/blocks \
-  -H "X-Admin-Key: YOUR_ADMIN_KEY"
-```
-
-## Scan Patterns
-
-When prompted by `wrangler secret put SCAN_PATTERNS`, paste a JSON array of regex strings:
+When you set `SCAN_PATTERNS`, paste a JSON list of patterns to watch for:
 
 ```json
 [
-  "AKIA[0-9A-Z]{16}",
   "sk-ant-api[a-zA-Z0-9_-]{20,}",
-  "sk-[a-zA-Z0-9]{20,}",
-  "(SECRET|TOKEN|PASSWORD|API_KEY|APIKEY)\\s*[=:]\\s*['\"]?[a-zA-Z0-9_/+=-]{8,}",
-  "-----BEGIN (RSA |EC )?PRIVATE KEY-----",
+  "sk-proj-[a-zA-Z0-9_-]{20,}",
+  "AKIA[0-9A-Z]{16}",
   "ghp_[a-zA-Z0-9]{36}",
+  "(SECRET|TOKEN|PASSWORD|API_KEY)\\s*[=:]\\s*['\"]?[a-zA-Z0-9_/+=-]{8,}",
+  "-----BEGIN (RSA |EC )?PRIVATE KEY-----",
   "HONEYPOT_CANARY_[A-Z0-9]+"
 ]
 ```
 
-**How to use honeypot tokens**: Plant fake secrets in your agent's environment (e.g., `HONEYPOT_CANARY_ABC123`). If your agent ever includes them in a request, UFW catches it instantly. It's a tripwire — if it fires, something is wrong.
+**Pro tip:** Plant a fake secret like `HONEYPOT_CANARY_ABC123` in your agent's environment. If it ever shows up in a request, you'll know something is seriously wrong. It's a tripwire.
 
-Update patterns anytime with `wrangler secret put SCAN_PATTERNS` and paste the new array. Takes effect on next deploy or within minutes.
+## Check On Things
 
-## Limitations
+```bash
+# Health check
+curl -X POST https://your-worker.workers.dev/admin/test \
+  -H "X-Admin-Key: YOUR_ADMIN_KEY"
 
-**KV rate limiting is eventually consistent.** Cloudflare KV propagates globally in ~60 seconds. For personal use and small teams, this means your rate limits are approximate, not exact. At scale, the upgrade path is Cloudflare Durable Objects — same Worker, stronger guarantees.
+# See usage stats (last 24 hours)
+curl https://your-worker.workers.dev/admin/stats \
+  -H "X-Admin-Key: YOUR_ADMIN_KEY"
 
-**Auth is a static bearer token.** This isn't multi-tenant OAuth. It's a shared secret between your agent and your Worker. Simple, effective, and you rotate it with one command: `wrangler secret put PROXY_KEY`. For teams, you'd want per-agent keys — easy to add.
+# See what got blocked
+curl https://your-worker.workers.dev/admin/blocks \
+  -H "X-Admin-Key: YOUR_ADMIN_KEY"
+```
 
-**Pattern scanning catches known formats.** It won't catch a secret that's been base64-encoded or split across multiple fields. That's by design — no false positives, no AI guessing, just deterministic matching. Add patterns as you discover new formats.
+## Good to Know
 
-**Free to run.** Cloudflare Workers free tier includes 100K requests/day and KV includes 100K reads + 1K writes/day. More than enough for personal use. Paid plans start at $5/month if you outgrow it.
+- **Rate limits are approximate**, not exact to the millisecond. Close enough for protecting a budget, not designed for billing-grade precision.
+- **Pattern scanning catches known formats.** If a secret is encoded or split across fields, it won't catch it. That's on purpose — no false positives, no guessing.
+- **The proxy token is a shared secret.** One token for all your agents. Simple. If you need per-agent auth later, it's easy to add.
 
 ## License
 
-MIT. Use it, fork it, deploy it.
+MIT. Use it however you want.
 
-If you want this as a managed service — no setup, hosted dashboard, team support — drop your email at [cerul.org](https://cerul.org). Or just paste this README into your AI and deploy it yourself.
+Built for [ClawBot](https://github.com/Fruitloop24) and anyone else who wants to experiment with AI agents without losing sleep over leaked keys and runaway bills.
