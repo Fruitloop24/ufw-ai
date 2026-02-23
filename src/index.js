@@ -75,6 +75,21 @@ export default {
     // --- Proxy forward ---
     const restPath = '/' + segments.slice(1).join('/');
     const upstreamUrl = provider.upstream + restPath + url.search;
+    const isChatCompletions = restPath.endsWith('/chat/completions');
+
+    // Force non-streaming on chat completions so we can scan the full response
+    let forwardBody = body;
+    if (isChatCompletions && body && request.method === 'POST') {
+      try {
+        const parsed = JSON.parse(body);
+        if (parsed.stream === true) {
+          parsed.stream = false;
+          forwardBody = JSON.stringify(parsed);
+        }
+      } catch {
+        // Not valid JSON — forward as-is
+      }
+    }
 
     const proxyHeaders = new Headers(request.headers);
     // Remove the proxy auth header before forwarding
@@ -91,17 +106,14 @@ export default {
     const upstreamResponse = await fetch(upstreamUrl, {
       method: request.method,
       headers: proxyHeaders,
-      body: request.method !== 'GET' && request.method !== 'HEAD' ? body : undefined,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? forwardBody : undefined,
     });
 
     // --- Usage logging (non-blocking) ---
     ctx.waitUntil(logUsage(env, agentId, providerName, body, now));
 
-    // --- Outbound response scanning (non-streaming chat completions only) ---
-    const isChatCompletions = restPath.endsWith('/chat/completions');
-    const isStreaming = upstreamResponse.headers.get('content-type')?.includes('text/event-stream');
-
-    if (isChatCompletions && !isStreaming && upstreamResponse.status === 200) {
+    // --- Outbound response scanning (chat completions only) ---
+    if (isChatCompletions && upstreamResponse.status === 200) {
       const responseBody = await upstreamResponse.text();
       const { redacted, matched } = scanResponseContent(env, responseBody);
 
@@ -280,13 +292,24 @@ const RESPONSE_PATTERNS = [
   /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}:[a-f0-9]{32}/g,
 ];
 
-function getHoneypots(env) {
-  const tokens = [];
+const KNOWN_SECRET_KEYS = [
+  'PROXY_KEY', 'ADMIN_KEY',
+  'ANTHROPIC_API_KEY', 'OPENAI_API_KEY', 'OPENROUTER_API_KEY',
+  'DEEPSEEK_API_KEY', 'KIMI_API_KEY',
+];
+
+function getKnownSecrets(env) {
+  const secrets = [];
+  for (const key of KNOWN_SECRET_KEYS) {
+    const val = env[key];
+    if (val && val.length >= 8) secrets.push({ name: key, value: val });
+  }
+  // Honeypots
   for (let i = 1; i <= 10; i++) {
     const val = env[`HONEYPOT_${i}`];
-    if (val) tokens.push(val);
+    if (val) secrets.push({ name: `HONEYPOT_${i}`, value: val });
   }
-  return tokens;
+  return secrets;
 }
 
 function scanResponseContent(env, responseBody) {
@@ -303,7 +326,7 @@ function scanResponseContent(env, responseBody) {
   }
 
   const matched = [];
-  const honeypots = getHoneypots(env);
+  const knownSecrets = getKnownSecrets(env);
 
   for (const choice of choices) {
     const content = choice?.message?.content;
@@ -311,17 +334,17 @@ function scanResponseContent(env, responseBody) {
 
     let scanned = content;
 
-    // Check honeypots first (exact match — guaranteed leak)
-    for (const honey of honeypots) {
-      if (scanned.includes(honey)) {
-        matched.push(`honeypot:${honey.slice(0, 8)}...`);
-        scanned = scanned.split(honey).join('[REDACTED-BY-UFW]');
+    // Check known secrets first (exact match — PROXY_KEY, real API keys, honeypots)
+    for (const secret of knownSecrets) {
+      if (scanned.includes(secret.value)) {
+        matched.push(`known:${secret.name}`);
+        scanned = scanned.split(secret.value).join('[REDACTED-BY-UFW]');
       }
     }
 
-    // Regex pattern scan
+    // Regex pattern scan for generic secret shapes
     for (const pattern of RESPONSE_PATTERNS) {
-      pattern.lastIndex = 0; // reset global regex state
+      pattern.lastIndex = 0;
       if (pattern.test(scanned)) {
         matched.push(`pattern:${pattern.source.slice(0, 30)}`);
         pattern.lastIndex = 0;
