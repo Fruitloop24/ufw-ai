@@ -90,6 +90,22 @@ Authorization: Bearer YOUR_PROXY_KEY
 
 Your agent doesn't need any real API keys. UFW handles that part.
 
+## Why This Actually Works
+
+Here's the thing — you can't use AI to watch AI. An LLM reviewing its own output for secrets is slow, expensive, and it guesses. It'll miss things. It'll block clean requests. You're paying inference costs to maybe catch a problem.
+
+UFW doesn't use AI at all. It uses **regex** — regular expressions. The same pattern-matching that's been protecting networks since the early days of `ipchains` and `iptables`. The same idea behind every firewall and packet filter ever written.
+
+It works like this: every API key has a recognizable shape. Anthropic keys start with `sk-ant-api`. OpenAI keys start with `sk-proj-`. AWS keys start with `AKIA` followed by exactly 16 uppercase characters. GitHub tokens start with `ghp_`. These aren't secrets about secrets — they're public prefixes that every developer knows.
+
+UFW checks every outbound request body against these patterns. Does this string contain something shaped like an API key? Yes or no. That's it. There's no intelligence to outsmart, no model to jailbreak, no prompt injection that gets around it. It's a boolean match. It either looks like a key or it doesn't.
+
+And it runs in about a millisecond because pattern matching is one of the cheapest operations a computer can do. Your agent doesn't slow down. Your costs don't go up. It just works, quietly, every single time.
+
+**This is where the community comes in.** The patterns we ship are a starting point — common API keys, passwords, private keys. But the world keeps making new things to catch. QR code payloads. Weird encoding tricks. New provider key formats. Irregular stuff nobody's thought of yet. Every pattern someone contributes makes every UFW deployment safer. Fork it, add your patterns, open a PR. The more eyes on this, the better it gets for everyone.
+
+Old-school regex stopping the smartest machines on the planet. Sometimes the simple thing is the right thing.
+
 ## Kill Switch
 
 Shut everything down:
@@ -147,6 +163,12 @@ curl https://your-worker.workers.dev/admin/blocks \
 - **Rate limits are approximate**, not exact to the millisecond. Close enough for protecting a budget, not designed for billing-grade precision.
 - **Pattern scanning catches known formats.** If a secret is encoded or split across fields, it won't catch it. That's on purpose — no false positives, no guessing.
 - **The proxy token is a shared secret.** One token for all your agents. Simple. If you need per-agent auth later, it's easy to add.
+
+## Need Help?
+
+Paste this entire README into Claude, ChatGPT, or whatever AI you've got and tell it to set this up for you. It'll walk you through every step — that's literally what it's for.
+
+Want it managed instead — hosted dashboard, team support, no setup? Drop your email at [cerul.org](https://cerul.org).
 
 ## License
 
