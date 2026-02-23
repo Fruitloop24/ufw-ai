@@ -161,7 +161,8 @@ curl https://your-worker.workers.dev/admin/blocks \
 ## Good to Know
 
 - **Rate limits are approximate**, not exact to the millisecond. Close enough for protecting a budget, not designed for billing-grade precision.
-- **Pattern scanning catches known formats.** If a secret is encoded or split across fields, it won't catch it. That's on purpose — no false positives, no guessing.
+- **Pattern scanning catches known formats.** If a secret is encoded, obfuscated, or split across fields, it won't catch it. We don't pretend to catch everything — and that's exactly why this is a community project. Every new pattern someone contributes makes every deployment safer. New provider key format? Weird encoding trick? Open a PR.
+- **Rate limiting is real budget protection.** Your agent goes into a loop at 3am? UFW cuts it off at 30 requests per minute. That's the difference between waking up to a $0.47 balance and waking up to a normal day. Not exact to the millisecond — close enough to save your money.
 - **The proxy token is a shared secret.** One token for all your agents. Simple. If you need per-agent auth later, it's easy to add.
 
 ## Need Help?
