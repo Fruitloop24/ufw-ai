@@ -23,5 +23,7 @@ id = "258173fc854243d696eb639c565a0db1"
 # KIMI_API_KEY       — real Moonshot/Kimi API key
 # SCAN_PATTERNS      — JSON array of regex strings for secret scanning
 # DISCORD_WEBHOOK_URL— Discord webhook for block alerts
+# ALERT_WEBHOOK_URL  — Discord webhook for response leak alerts (falls back to DISCORD_WEBHOOK_URL)
+# HONEYPOT_1..10     — fake secrets planted as tripwires (exact match in responses = guaranteed leak)
 # RATE_LIMIT_PER_MIN — max requests per agent per minute (default: 30)
 # RATE_LIMIT_PER_HOUR— max requests per agent per hour (default: 500)

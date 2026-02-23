@@ -97,7 +97,30 @@ export default {
     // --- Usage logging (non-blocking) ---
     ctx.waitUntil(logUsage(env, agentId, providerName, body, now));
 
-    // Return upstream response unchanged
+    // --- Outbound response scanning (non-streaming chat completions only) ---
+    const isChatCompletions = restPath.endsWith('/chat/completions');
+    const isStreaming = upstreamResponse.headers.get('content-type')?.includes('text/event-stream');
+
+    if (isChatCompletions && !isStreaming && upstreamResponse.status === 200) {
+      const responseBody = await upstreamResponse.text();
+      const { redacted, matched } = scanResponseContent(env, responseBody);
+
+      if (matched.length > 0) {
+        ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
+        return new Response(redacted, {
+          status: upstreamResponse.status,
+          headers: upstreamResponse.headers,
+        });
+      }
+
+      // No matches — return the original body we already consumed
+      return new Response(responseBody, {
+        status: upstreamResponse.status,
+        headers: upstreamResponse.headers,
+      });
+    }
+
+    // Non-chat or streaming — pass through unchanged
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       headers: upstreamResponse.headers,
@@ -243,6 +266,81 @@ function scanSecrets(env, body) {
   return null;
 }
 
+// ==================== Outbound Response Scanning ====================
+
+const RESPONSE_PATTERNS = [
+  /sk-[a-zA-Z0-9]{20,}/g,
+  /ghp_[a-zA-Z0-9]{36}/g,
+  /eyJ[a-zA-Z0-9_-]{20,}/g,
+  /AKIA[A-Z0-9]{16}/g,
+  /rpa_[a-zA-Z0-9]{40,}/g,
+  /xox[bpras]-[a-zA-Z0-9-]{10,}/g,
+  /[0-9]+:AA[a-zA-Z0-9_-]{30,}/g,
+  /[a-f0-9]{64}/g,
+  /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}:[a-f0-9]{32}/g,
+];
+
+function getHoneypots(env) {
+  const tokens = [];
+  for (let i = 1; i <= 10; i++) {
+    const val = env[`HONEYPOT_${i}`];
+    if (val) tokens.push(val);
+  }
+  return tokens;
+}
+
+function scanResponseContent(env, responseBody) {
+  let parsed;
+  try {
+    parsed = JSON.parse(responseBody);
+  } catch {
+    return { redacted: responseBody, matched: [] };
+  }
+
+  const choices = parsed.choices;
+  if (!Array.isArray(choices)) {
+    return { redacted: responseBody, matched: [] };
+  }
+
+  const matched = [];
+  const honeypots = getHoneypots(env);
+
+  for (const choice of choices) {
+    const content = choice?.message?.content;
+    if (typeof content !== 'string') continue;
+
+    let scanned = content;
+
+    // Check honeypots first (exact match — guaranteed leak)
+    for (const honey of honeypots) {
+      if (scanned.includes(honey)) {
+        matched.push(`honeypot:${honey.slice(0, 8)}...`);
+        scanned = scanned.split(honey).join('[REDACTED-BY-UFW]');
+      }
+    }
+
+    // Regex pattern scan
+    for (const pattern of RESPONSE_PATTERNS) {
+      pattern.lastIndex = 0; // reset global regex state
+      if (pattern.test(scanned)) {
+        matched.push(`pattern:${pattern.source.slice(0, 30)}`);
+        pattern.lastIndex = 0;
+        scanned = scanned.replace(pattern, '[REDACTED-BY-UFW]');
+      }
+    }
+
+    if (scanned !== content) {
+      choice.message.content = scanned;
+    }
+  }
+
+  if (matched.length > 0) {
+    return { redacted: JSON.stringify(parsed), matched };
+  }
+
+  return { redacted: responseBody, matched: [] };
+}
+
 // ==================== Logging ====================
 
 async function logBlock(env, agentId, provider, reason, body) {
@@ -272,6 +370,38 @@ async function logBlock(env, agentId, provider, reason, body) {
       // Discord alert is best-effort
     }
   }
+}
+
+async function logResponseLeak(env, agentId, provider, matched) {
+  const ts = new Date().toISOString();
+  const key = `blocked:${ts}:${agentId}:response`;
+  const record = {
+    timestamp: ts,
+    agent_id: agentId,
+    provider,
+    reason: 'response_secret_redacted',
+    matched_patterns: matched,
+  };
+
+  await env.UFW_LOGS.put(key, JSON.stringify(record), { expirationTtl: 86400 * 7 });
+
+  // Alert webhook (Discord or other)
+  const webhookUrl = env.ALERT_WEBHOOK_URL || env.DISCORD_WEBHOOK_URL;
+  if (webhookUrl) {
+    try {
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: `**UFW RESPONSE REDACTION** | Agent: \`${agentId}\` | Provider: \`${provider}\` | Patterns: \`${matched.join(', ')}\` | Time: ${ts}`,
+        }),
+      });
+    } catch {
+      // Alert is best-effort
+    }
+  }
+
+  console.log(`[UFW] Response redaction: agent=${agentId} provider=${provider} patterns=${matched.join(',')}`);
 }
 
 async function logUsage(env, agentId, provider, body, now) {
