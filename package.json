@@ -1,0 +1,7 @@
+{
+  "name": "ufw",
+  "version": "1.0.0",
+  "description": "Universal Firewall — AI agent API proxy with secret scanning, rate limiting, and kill switch",
+  "main": "src/index.js",
+  "private": true
+}

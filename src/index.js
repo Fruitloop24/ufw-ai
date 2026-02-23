@@ -1,0 +1,301 @@
+// UFW — Universal Firewall for AI Agents
+// Single Cloudflare Worker: secret scanning, rate limiting, kill switch, provider routing
+
+const PROVIDERS = {
+  anthropic: { upstream: 'https://api.anthropic.com', keyHeader: 'x-api-key', keyEnv: 'ANTHROPIC_API_KEY' },
+  openrouter: { upstream: 'https://openrouter.ai/api', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'OPENROUTER_API_KEY' },
+  openai: { upstream: 'https://api.openai.com', keyHeader: 'authorization', keyPrefix: 'Bearer ', keyEnv: 'OPENAI_API_KEY' },
+};
+
+const json = (data, status = 200) => new Response(JSON.stringify(data), {
+  status, headers: { 'content-type': 'application/json' },
+});
+
+const truncate = (str, max = 4096) => str.length > max ? str.slice(0, max) + '...[truncated]' : str;
+
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // --- Admin endpoints ---
+    if (path.startsWith('/admin/')) {
+      return handleAdmin(path, request, env);
+    }
+
+    // --- Provider routing ---
+    const segments = path.split('/').filter(Boolean);
+    const providerName = segments[0];
+    const provider = PROVIDERS[providerName];
+    if (!provider) {
+      return json({ error: 'Unknown route. Use /anthropic/*, /openrouter/*, or /openai/*' }, 404);
+    }
+
+    const agentId = request.headers.get('x-agent-id') || 'default';
+    const body = request.method !== 'GET' ? await request.text() : '';
+
+    // --- Kill switch ---
+    const enabled = await env.UFW_LOGS.get('ENABLED');
+    if (enabled === 'false') {
+      ctx.waitUntil(logBlock(env, agentId, providerName, 'kill_switch', body));
+      return json({ error: 'UFW kill switch is active. All requests are blocked.', code: 'KILL_SWITCH' }, 503);
+    }
+
+    // --- Proxy auth ---
+    const authHeader = request.headers.get('authorization') || '';
+    const proxyToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!proxyToken || proxyToken !== env.PROXY_KEY) {
+      return json({ error: 'Unauthorized. Provide Authorization: Bearer <PROXY_KEY>' }, 401);
+    }
+
+    // --- Rate limiting ---
+    const now = new Date();
+    const minBucket = now.toISOString().slice(0, 16); // YYYY-MM-DDTHH:mm
+    const hrBucket = now.toISOString().slice(0, 13);   // YYYY-MM-DDTHH
+    const perMin = parseInt(env.RATE_LIMIT_PER_MIN) || 30;
+    const perHour = parseInt(env.RATE_LIMIT_PER_HOUR) || 500;
+
+    const rateLimitResult = await checkRateLimit(env, agentId, minBucket, hrBucket, perMin, perHour);
+    if (rateLimitResult) {
+      ctx.waitUntil(logBlock(env, agentId, providerName, rateLimitResult, body));
+      return json({ error: `Rate limit exceeded: ${rateLimitResult}`, code: 'RATE_LIMITED' }, 429);
+    }
+
+    // --- Secret scanning ---
+    if (body) {
+      const scanResult = scanSecrets(env, body);
+      if (scanResult) {
+        ctx.waitUntil(logBlock(env, agentId, providerName, `secret_detected:${scanResult}`, body));
+        return json({ error: 'Request blocked: potential secret detected in request body', code: 'SECRET_DETECTED', pattern: scanResult }, 403);
+      }
+    }
+
+    // --- Proxy forward ---
+    const restPath = '/' + segments.slice(1).join('/');
+    const upstreamUrl = provider.upstream + restPath + url.search;
+
+    const proxyHeaders = new Headers(request.headers);
+    // Remove the proxy auth header before forwarding
+    proxyHeaders.delete('authorization');
+    // Inject the real API key
+    const realKey = env[provider.keyEnv];
+    if (provider.keyPrefix) {
+      proxyHeaders.set(provider.keyHeader, provider.keyPrefix + realKey);
+    } else {
+      proxyHeaders.set(provider.keyHeader, realKey);
+    }
+    proxyHeaders.delete('host');
+
+    const upstreamResponse = await fetch(upstreamUrl, {
+      method: request.method,
+      headers: proxyHeaders,
+      body: request.method !== 'GET' && request.method !== 'HEAD' ? body : undefined,
+    });
+
+    // --- Usage logging (non-blocking) ---
+    ctx.waitUntil(logUsage(env, agentId, providerName, body, now));
+
+    // Return upstream response unchanged
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: upstreamResponse.headers,
+    });
+  },
+};
+
+// ==================== Admin Handlers ====================
+
+async function handleAdmin(path, request, env) {
+  const adminKey = request.headers.get('x-admin-key');
+  if (!adminKey || adminKey !== env.ADMIN_KEY) {
+    return json({ error: 'Unauthorized. Provide X-Admin-Key header.' }, 401);
+  }
+
+  if (path === '/admin/kill' && request.method === 'POST') {
+    return adminKill(request, env);
+  }
+  if (path === '/admin/stats' && request.method === 'GET') {
+    return adminStats(env);
+  }
+  if (path === '/admin/blocks' && request.method === 'GET') {
+    return adminBlocks(env);
+  }
+  if (path === '/admin/test' && request.method === 'POST') {
+    return adminTest(env);
+  }
+
+  return json({ error: 'Unknown admin endpoint' }, 404);
+}
+
+async function adminKill(request, env) {
+  const body = await request.json().catch(() => null);
+  if (!body || typeof body.enabled !== 'boolean') {
+    return json({ error: 'Body must be {"enabled": true/false}' }, 400);
+  }
+  await env.UFW_LOGS.put('ENABLED', String(body.enabled));
+  return json({ status: 'ok', enabled: body.enabled });
+}
+
+async function adminStats(env) {
+  const now = new Date();
+  const stats = {};
+
+  // List all stat keys once
+  const list = await env.UFW_LOGS.list({ prefix: 'stats:' });
+
+  // Build set of valid hourly buckets (last 24h)
+  const validBuckets = new Set();
+  for (let i = 0; i < 24; i++) {
+    validBuckets.add(new Date(now.getTime() - i * 3600000).toISOString().slice(0, 13));
+  }
+
+  // Filter and aggregate
+  const reads = list.keys
+    .filter(k => {
+      const parts = k.name.split(':');
+      return parts.length === 3 && validBuckets.has(parts[2]);
+    })
+    .map(async k => {
+      const parts = k.name.split(':'); // stats:{agent}:{bucket}
+      const agent = parts[1];
+      const bucket = parts[2];
+      const val = parseInt(await env.UFW_LOGS.get(k.name)) || 0;
+      if (!stats[agent]) stats[agent] = { total: 0, hours: {} };
+      stats[agent].total += val;
+      stats[agent].hours[bucket] = val;
+    });
+
+  await Promise.all(reads);
+  return json({ period: 'last_24h', stats });
+}
+
+async function adminBlocks(env) {
+  const list = await env.UFW_LOGS.list({ prefix: 'blocked:', limit: 50 });
+  const blocks = [];
+  for (const key of list.keys) {
+    const val = await env.UFW_LOGS.get(key.name);
+    try {
+      blocks.push(JSON.parse(val));
+    } catch {
+      blocks.push({ key: key.name, raw: val });
+    }
+  }
+  return json({ count: blocks.length, blocks });
+}
+
+async function adminTest(env) {
+  const enabled = await env.UFW_LOGS.get('ENABLED');
+  const agentList = await env.UFW_LOGS.list({ prefix: 'stats:' });
+  const agents = [...new Set(agentList.keys.map(k => k.name.split(':')[1]))];
+
+  return json({
+    status: 'ok',
+    enabled: enabled !== 'false',
+    agents_seen: agents,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// ==================== Rate Limiting ====================
+
+async function checkRateLimit(env, agentId, minBucket, hrBucket, perMin, perHour) {
+  const minKey = `rate:${agentId}:min:${minBucket}`;
+  const hrKey = `rate:${agentId}:hr:${hrBucket}`;
+
+  const [minCount, hrCount] = await Promise.all([
+    env.UFW_LOGS.get(minKey).then(v => parseInt(v) || 0),
+    env.UFW_LOGS.get(hrKey).then(v => parseInt(v) || 0),
+  ]);
+
+  if (minCount >= perMin) return `${perMin}/min`;
+  if (hrCount >= perHour) return `${perHour}/hr`;
+
+  // Increment both counters
+  await Promise.all([
+    env.UFW_LOGS.put(minKey, String(minCount + 1), { expirationTtl: 120 }),
+    env.UFW_LOGS.put(hrKey, String(hrCount + 1), { expirationTtl: 7200 }),
+  ]);
+
+  return null;
+}
+
+// ==================== Secret Scanning ====================
+
+function scanSecrets(env, body) {
+  let patterns;
+  try {
+    patterns = JSON.parse(env.SCAN_PATTERNS || '[]');
+  } catch {
+    return null; // If patterns are malformed, don't block
+  }
+
+  for (const pat of patterns) {
+    try {
+      if (new RegExp(pat, 'i').test(body)) {
+        return pat;
+      }
+    } catch {
+      continue; // Skip invalid regex
+    }
+  }
+  return null;
+}
+
+// ==================== Logging ====================
+
+async function logBlock(env, agentId, provider, reason, body) {
+  const ts = new Date().toISOString();
+  const key = `blocked:${ts}:${agentId}`;
+  const record = {
+    timestamp: ts,
+    agent_id: agentId,
+    provider,
+    reason,
+    body: truncate(body),
+  };
+
+  await env.UFW_LOGS.put(key, JSON.stringify(record), { expirationTtl: 86400 * 7 });
+
+  // Discord alert (fire and forget)
+  if (env.DISCORD_WEBHOOK_URL) {
+    try {
+      await fetch(env.DISCORD_WEBHOOK_URL, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: `**UFW BLOCK** | Agent: \`${agentId}\` | Provider: \`${provider}\` | Reason: \`${reason}\` | Time: ${ts}`,
+        }),
+      });
+    } catch {
+      // Discord alert is best-effort
+    }
+  }
+}
+
+async function logUsage(env, agentId, provider, body, now) {
+  const hrBucket = now.toISOString().slice(0, 13);
+  const statsKey = `stats:${agentId}:${hrBucket}`;
+
+  // Increment hourly counter
+  const current = parseInt(await env.UFW_LOGS.get(statsKey)) || 0;
+  await env.UFW_LOGS.put(statsKey, String(current + 1), { expirationTtl: 86400 * 2 });
+
+  // Individual call log
+  let model = 'unknown';
+  try {
+    const parsed = JSON.parse(body);
+    model = parsed.model || 'unknown';
+  } catch {
+    // Not JSON or no model field
+  }
+
+  const ts = now.toISOString();
+  const logKey = `log:${ts}:${agentId}`;
+  await env.UFW_LOGS.put(logKey, JSON.stringify({
+    timestamp: ts,
+    agent_id: agentId,
+    provider,
+    model,
+    status: 'passed',
+  }), { expirationTtl: 86400 * 2 });
+}
