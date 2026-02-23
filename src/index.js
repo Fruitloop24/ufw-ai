@@ -79,11 +79,14 @@ export default {
 
     // Force non-streaming on chat completions so we can scan the full response
     let forwardBody = body;
+    let wasStreaming = false;
     if (isChatCompletions && body && request.method === 'POST') {
       try {
         const parsed = JSON.parse(body);
-        if (parsed.stream === true) {
+        if (parsed.stream) {
+          wasStreaming = true;
           parsed.stream = false;
+          delete parsed.stream_options;
           forwardBody = JSON.stringify(parsed);
         }
       } catch {
@@ -102,6 +105,10 @@ export default {
       proxyHeaders.set(provider.keyHeader, realKey);
     }
     proxyHeaders.delete('host');
+    // Recalculate content-length when we modified the body
+    if (wasStreaming) {
+      proxyHeaders.delete('content-length');
+    }
 
     const upstreamResponse = await fetch(upstreamUrl, {
       method: request.method,
@@ -114,26 +121,34 @@ export default {
 
     // --- Outbound response scanning (chat completions only) ---
     if (isChatCompletions && upstreamResponse.status === 200) {
-      const responseBody = await upstreamResponse.text();
-      console.log(`[UFW] Scanning response: ${responseBody.length} bytes, content-type: ${upstreamResponse.headers.get('content-type')}`);
+      const contentType = upstreamResponse.headers.get('content-type') || '';
+      const isSSE = contentType.includes('text/event-stream');
+
+      let responseBody;
+      if (isSSE) {
+        // Provider ignored stream:false — buffer SSE, extract content, build JSON response
+        responseBody = await assembleSSEResponse(upstreamResponse);
+        console.log(`[UFW] Assembled SSE response: ${responseBody.length} bytes`);
+      } else {
+        responseBody = await upstreamResponse.text();
+      }
+
+      console.log(`[UFW] Scanning response: ${responseBody.length} bytes, content-type: ${contentType}`);
       const { redacted, matched } = scanResponseContent(env, responseBody);
+
+      const responseHeaders = new Headers(upstreamResponse.headers);
+      responseHeaders.set('content-type', 'application/json');
+      responseHeaders.delete('content-length');
 
       if (matched.length > 0) {
         ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
-        return new Response(redacted, {
-          status: upstreamResponse.status,
-          headers: upstreamResponse.headers,
-        });
+        return new Response(redacted, { status: 200, headers: responseHeaders });
       }
 
-      // No matches — return the original body we already consumed
-      return new Response(responseBody, {
-        status: upstreamResponse.status,
-        headers: upstreamResponse.headers,
-      });
+      return new Response(responseBody, { status: 200, headers: responseHeaders });
     }
 
-    // Non-chat or streaming — pass through unchanged
+    // Non-chat or non-200 — pass through unchanged
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       headers: upstreamResponse.headers,
@@ -277,6 +292,51 @@ function scanSecrets(env, body) {
     }
   }
   return null;
+}
+
+// ==================== SSE Response Assembly ====================
+
+async function assembleSSEResponse(response) {
+  const text = await response.text();
+  const lines = text.split('\n');
+
+  let role = 'assistant';
+  let content = '';
+  let model = 'unknown';
+  let id = '';
+  let finishReason = null;
+
+  for (const line of lines) {
+    if (!line.startsWith('data: ')) continue;
+    const data = line.slice(6).trim();
+    if (data === '[DONE]') continue;
+
+    try {
+      const chunk = JSON.parse(data);
+      if (chunk.id) id = chunk.id;
+      if (chunk.model) model = chunk.model;
+      const delta = chunk.choices?.[0]?.delta;
+      if (delta?.role) role = delta.role;
+      if (delta?.content) content += delta.content;
+      if (chunk.choices?.[0]?.finish_reason) finishReason = chunk.choices[0].finish_reason;
+    } catch {
+      continue;
+    }
+  }
+
+  // Rebuild as a standard non-streaming response
+  const assembled = {
+    id: id || 'chatcmpl-assembled',
+    object: 'chat.completion',
+    model,
+    choices: [{
+      index: 0,
+      message: { role, content },
+      finish_reason: finishReason || 'stop',
+    }],
+  };
+
+  return JSON.stringify(assembled);
 }
 
 // ==================== Outbound Response Scanning ====================
