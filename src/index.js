@@ -112,7 +112,7 @@ export default {
           const hasKnownLeak = matched.some(m => m.startsWith('known:'));
           ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
           if (hasKnownLeak) {
-            ctx.waitUntil(autoKill(env, agentId, providerName, matched));
+            await autoKill(env, agentId, providerName, matched);
           }
           const redactedSSE = buildRedactedSSE(assembled, scannedContent);
           return new Response(redactedSSE, {
@@ -133,7 +133,7 @@ export default {
           const hasKnownLeak = matched.some(m => m.startsWith('known:'));
           ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
           if (hasKnownLeak) {
-            ctx.waitUntil(autoKill(env, agentId, providerName, matched));
+            await autoKill(env, agentId, providerName, matched);
           }
           return new Response(redacted, { status: 200, headers: upstreamResponse.headers });
         }
