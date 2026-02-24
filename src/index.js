@@ -359,15 +359,18 @@ function buildRedactedSSE(assembled, redactedContent) {
 // ==================== Outbound Response Scanning ====================
 
 const RESPONSE_PATTERNS = [
-  /sk-[a-zA-Z0-9_-]{20,}/g,          // OpenAI, DeepSeek, generic (sk-proj-*, sk-ant-api03-*, etc.)
-  /ghp_[a-zA-Z0-9]{36}/g,            // GitHub personal access tokens
-  /eyJ[a-zA-Z0-9_-]{20,}/g,          // JWT tokens
-  /AKIA[A-Z0-9]{16}/g,               // AWS access key IDs
-  /rpa_[a-zA-Z0-9]{40,}/g,           // RunPod API keys
-  /xox[bpras]-[a-zA-Z0-9-]{10,}/g,   // Slack tokens
-  /[0-9]+:AA[a-zA-Z0-9_-]{30,}/g,    // Telegram bot tokens
-  /[a-f0-9]{64}/g,                   // 64-char hex strings (gateway tokens, etc.)
-  /[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}:[a-f0-9]{32}/g, // fal.ai UUID:hex
+  // Specific prefixes (high confidence, no false positives)
+  /sk[-_][a-zA-Z0-9_-]{20,}/g,            // OpenAI, DeepSeek, Stripe (sk-proj-*, sk_live_*, etc.)
+  /gh[pos]_[a-zA-Z0-9]{20,}/g,            // GitHub tokens (ghp_, gho_, ghs_)
+  /github_pat_[a-zA-Z0-9_]{20,}/g,        // GitHub fine-grained PATs
+  /xox[bpras]-[a-zA-Z0-9-]{10,}/g,        // Slack tokens
+  /AKIA[A-Z0-9]{16}/g,                    // AWS access key IDs
+  /eyJ[a-zA-Z0-9_-]{20,}/g,              // JWT tokens
+  /[0-9]+:AA[a-zA-Z0-9_-]{30,}/g,        // Telegram bot tokens
+  /rpa_[a-zA-Z0-9]{40,}/g,               // RunPod API keys
+
+  // Catch-all: 12+ unbroken chars with 4+ digits mixed in = smells like a key
+  /(?=(?:[^\s]*\d){4})[a-zA-Z0-9_\-/+=]{12,}/g,
 ];
 
 const KNOWN_SECRET_KEYS = [
