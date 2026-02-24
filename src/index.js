@@ -109,7 +109,11 @@ export default {
         const { scannedContent, matched } = scanText(env, assembled.content);
 
         if (matched.length > 0) {
+          const hasKnownLeak = matched.some(m => m.startsWith('known:'));
           ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
+          if (hasKnownLeak) {
+            ctx.waitUntil(autoKill(env, agentId, providerName, matched));
+          }
           const redactedSSE = buildRedactedSSE(assembled, scannedContent);
           return new Response(redactedSSE, {
             status: 200,
@@ -126,7 +130,11 @@ export default {
         const { redacted, matched } = scanResponseContent(env, responseBody);
 
         if (matched.length > 0) {
+          const hasKnownLeak = matched.some(m => m.startsWith('known:'));
           ctx.waitUntil(logResponseLeak(env, agentId, providerName, matched));
+          if (hasKnownLeak) {
+            ctx.waitUntil(autoKill(env, agentId, providerName, matched));
+          }
           return new Response(redacted, { status: 200, headers: upstreamResponse.headers });
         }
 
@@ -478,6 +486,27 @@ async function logBlock(env, agentId, provider, reason, body) {
       });
     } catch {
       // Discord alert is best-effort
+    }
+  }
+}
+
+async function autoKill(env, agentId, provider, matched) {
+  // Known secret leaked in response — shut everything down
+  await env.UFW_LOGS.put('ENABLED', 'false');
+  console.log(`[UFW] AUTO-KILL triggered: agent=${agentId} provider=${provider} matched=${matched.join(',')}`);
+
+  const webhookUrl = env.ALERT_WEBHOOK_URL || env.DISCORD_WEBHOOK_URL;
+  if (webhookUrl) {
+    try {
+      await fetch(webhookUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          content: `🚨 **UFW AUTO-KILL** — Known secret detected in AI response. All traffic stopped.\n\nAgent: \`${agentId}\`\nProvider: \`${provider}\`\nMatched: \`${matched.join(', ')}\`\nTime: ${new Date().toISOString()}\n\nRe-enable with: \`POST /admin/kill {"enabled": true}\``,
+        }),
+      });
+    } catch {
+      // Alert is best-effort
     }
   }
 }
