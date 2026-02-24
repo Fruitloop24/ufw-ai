@@ -311,7 +311,7 @@ function assembleSSEContent(rawSSE) {
 }
 
 function scanText(env, text) {
-  let scanned = text;
+  let scanned = stripInvisible(text);
   const matched = [];
   const knownSecrets = getKnownSecrets(env);
 
@@ -354,6 +354,12 @@ function buildRedactedSSE(assembled, redactedContent) {
   };
 
   return `data: ${JSON.stringify(chunk)}\n\ndata: ${JSON.stringify(doneChunk)}\n\ndata: [DONE]\n\n`;
+}
+
+// Strip invisible Unicode characters used to evade pattern matching
+const ZERO_WIDTH_RE = /[\u200B\u200C\u200D\u2060\uFEFF\u00AD\u034F\u17B4\u17B5\u180E]/g;
+function stripInvisible(str) {
+  return str.replace(ZERO_WIDTH_RE, '');
 }
 
 // ==================== Outbound Response Scanning ====================
@@ -413,7 +419,7 @@ function scanResponseContent(env, responseBody) {
     const content = choice?.message?.content;
     if (typeof content !== 'string') continue;
 
-    let scanned = content;
+    let scanned = stripInvisible(content);
 
     // Check known secrets first (exact match — PROXY_KEY, real API keys, honeypots)
     for (const secret of knownSecrets) {
